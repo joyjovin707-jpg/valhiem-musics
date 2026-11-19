@@ -63,26 +63,65 @@ export function resolvedSourceLabel(
   }
 }
 
+export interface DownloadTriggerOptions {
+  inlineDataUrl?: string;
+  proxiedSegments?: string[];
+  mimeType?: string;
+}
+
+function saveBlobAsFile(blob: Blob, filename?: string): void {
+  const objectUrl = URL.createObjectURL(blob);
+  const anchor = document.createElement('a');
+  anchor.href = objectUrl;
+  anchor.download = filename || 'download';
+  anchor.style.display = 'none';
+  document.body.appendChild(anchor);
+  anchor.click();
+  document.body.removeChild(anchor);
+  setTimeout(() => URL.revokeObjectURL(objectUrl), 15_000);
+}
+
 export async function triggerBrowserDownload(
   url: string,
   filename?: string,
+  options?: DownloadTriggerOptions,
 ): Promise<void> {
   try {
+    if (options?.inlineDataUrl) {
+      const res = await fetch(options.inlineDataUrl);
+      const blob = await res.blob();
+      saveBlobAsFile(blob, filename);
+      return;
+    }
+
+    if (options?.proxiedSegments && options.proxiedSegments.length > 0) {
+      const segs = options.proxiedSegments;
+      const buffers: ArrayBuffer[] = new Array(segs.length);
+      let cursor = 0;
+      const concurrency = Math.min(4, segs.length);
+      const worker = async () => {
+        while (cursor < segs.length) {
+          const i = cursor++;
+          const res = await fetch(segs[i]);
+          if (!res.ok) throw new Error(`Segment ${i + 1} failed (${res.status})`);
+          buffers[i] = await res.arrayBuffer();
+        }
+      };
+      await Promise.all(Array.from({ length: concurrency }, () => worker()));
+      const blob = new Blob(buffers, {
+        type: options.mimeType || 'audio/mp4',
+      });
+      saveBlobAsFile(blob, filename);
+      return;
+    }
+
     const res = await fetch(url);
     if (!res.ok) throw new Error('Download stream failed');
     const blob = await res.blob();
-    const objectUrl = URL.createObjectURL(blob);
-    const anchor = document.createElement('a');
-    anchor.href = objectUrl;
-    anchor.download = filename || 'download';
-    anchor.style.display = 'none';
-    document.body.appendChild(anchor);
-    anchor.click();
-    document.body.removeChild(anchor);
-    setTimeout(() => URL.revokeObjectURL(objectUrl), 15_000);
+    saveBlobAsFile(blob, filename);
   } catch {
     const anchor = document.createElement('a');
-    anchor.href = url;
+    anchor.href = options?.inlineDataUrl || url;
     if (filename) {
       anchor.download = filename;
     }

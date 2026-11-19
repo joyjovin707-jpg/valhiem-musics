@@ -272,6 +272,9 @@ export default function App() {
             state: 'ready',
             resolvedSource: payload.resolvedSource,
             downloadUrl: payload.downloadUrl,
+            inlineDataUrl: payload.inlineDataUrl,
+            proxiedSegments: payload.proxiedSegments,
+            mimeType: payload.mimeType,
             filename: payload.filename,
             sizeBytes: payload.sizeBytes,
           },
@@ -285,6 +288,9 @@ export default function App() {
                   state: 'ready',
                   resolvedSource: payload.resolvedSource,
                   downloadUrl: payload.downloadUrl,
+                  inlineDataUrl: payload.inlineDataUrl,
+                  proxiedSegments: payload.proxiedSegments,
+                  mimeType: payload.mimeType,
                   filename: payload.filename,
                   sizeBytes: payload.sizeBytes,
                 }
@@ -292,7 +298,11 @@ export default function App() {
           ),
         );
 
-        await triggerBrowserDownload(payload.downloadUrl, payload.filename);
+        await triggerBrowserDownload(payload.downloadUrl, payload.filename, {
+          inlineDataUrl: payload.inlineDataUrl,
+          proxiedSegments: payload.proxiedSegments,
+          mimeType: payload.mimeType,
+        });
         return true;
       } catch (err) {
         const msg =
@@ -362,7 +372,11 @@ export default function App() {
     for (const track of readyTracks) {
       const status = trackStatuses[track.id];
       if (status?.downloadUrl) {
-        await triggerBrowserDownload(status.downloadUrl, status.filename);
+        await triggerBrowserDownload(status.downloadUrl, status.filename, {
+          inlineDataUrl: status.inlineDataUrl,
+          proxiedSegments: status.proxiedSegments,
+          mimeType: status.mimeType,
+        });
         await new Promise((r) => setTimeout(r, 350));
       }
     }
@@ -424,6 +438,9 @@ export default function App() {
           state: 'ready',
           resolvedSource: payload.resolvedSource,
           downloadUrl: payload.downloadUrl,
+          inlineDataUrl: payload.inlineDataUrl,
+          proxiedSegments: payload.proxiedSegments,
+          mimeType: payload.mimeType,
           filename: payload.filename,
           sizeBytes: payload.sizeBytes,
           createdAt: Date.now(),
@@ -431,7 +448,11 @@ export default function App() {
         ...prev.slice(0, 49),
       ]);
 
-      await triggerBrowserDownload(payload.downloadUrl, payload.filename);
+      await triggerBrowserDownload(payload.downloadUrl, payload.filename, {
+        inlineDataUrl: payload.inlineDataUrl,
+        proxiedSegments: payload.proxiedSegments,
+        mimeType: payload.mimeType,
+      });
     } catch (err) {
       setZipError(
         err instanceof Error ? err.message : 'Failed to package ZIP archive.',

@@ -111,6 +111,11 @@ export function QueuePanel({ items, onClearHistory }: QueuePanelProps) {
                         void triggerBrowserDownload(
                           item.downloadUrl!,
                           item.filename,
+                          {
+                            inlineDataUrl: item.inlineDataUrl,
+                            proxiedSegments: item.proxiedSegments,
+                            mimeType: item.mimeType,
+                          },
                         )
                       }
                       className="inline-flex items-center gap-1.5 rounded-md border border-zinc-700 bg-zinc-800/80 px-3 py-1.5 text-xs font-medium text-zinc-200 hover:border-lime-400/50 hover:text-lime-200 whitespace-nowrap shrink-0 cursor-pointer"

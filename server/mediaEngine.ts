@@ -24,6 +24,84 @@ const execFileAsync = promisify(execFile);
 const createSpotifyUrlInfo = require('spotify-url-info') as SpotifyUrlInfoModule;
 const spotifyInfo = createSpotifyUrlInfo(fetch);
 
+const ffmpegStaticPath = (() => {
+  try {
+    const p = require('ffmpeg-static') as string | null;
+    return p && fs.existsSync(p) ? p : null;
+  } catch {
+    return null;
+  }
+})();
+
+export function getFfmpegPath(): string | null {
+  if (fs.existsSync('/usr/bin/ffmpeg')) return '/usr/bin/ffmpeg';
+  if (ffmpegStaticPath && fs.existsSync(ffmpegStaticPath)) return ffmpegStaticPath;
+  return null;
+}
+
+const isServerless = Boolean(
+  process.env.VERCEL ||
+    process.env.AWS_LAMBDA_FUNCTION_NAME ||
+    process.env.NETLIFY,
+);
+
+const SERVERLESS_MAX_INLINE_BYTES = 3_100_000;
+const SEGMENT_SECRET =
+  process.env.SEGMENT_SECRET ||
+  process.env.VERCEL_PROJECT_ID ||
+  process.env.GEMINI_API_KEY ||
+  'valhiem-segment-secret-v1';
+
+const ALLOWED_SEGMENT_HOSTS = [
+  'soundcloud.cloud',
+  'sndcdn.com',
+  'audius.co',
+  'scdn.co',
+];
+
+export function signSegmentUrl(targetUrl: string): string {
+  const payload = Buffer.from(
+    JSON.stringify({ u: targetUrl, exp: Date.now() + 30 * 60_000 }),
+    'utf8',
+  ).toString('base64url');
+  const sig = crypto
+    .createHmac('sha256', SEGMENT_SECRET)
+    .update(payload)
+    .digest('hex')
+    .slice(0, 24);
+  return `${payload}.${sig}`;
+}
+
+export function verifySegmentToken(token: string): string | null {
+  const dot = token.indexOf('.');
+  if (dot <= 0) return null;
+  const payload = token.slice(0, dot);
+  const sig = token.slice(dot + 1);
+  const expected = crypto
+    .createHmac('sha256', SEGMENT_SECRET)
+    .update(payload)
+    .digest('hex')
+    .slice(0, 24);
+  if (sig.length !== expected.length) return null;
+  if (!crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(expected))) {
+    return null;
+  }
+  try {
+    const parsed = JSON.parse(
+      Buffer.from(payload, 'base64url').toString('utf8'),
+    ) as { u?: string; exp?: number };
+    if (!parsed.u || !parsed.exp || parsed.exp < Date.now()) return null;
+    const u = new URL(parsed.u);
+    if (u.protocol !== 'https:') return null;
+    const hostAllowed = ALLOWED_SEGMENT_HOSTS.some(
+      (h) => u.hostname === h || u.hostname.endsWith(`.${h}`),
+    );
+    return hostAllowed ? u.toString() : null;
+  } catch {
+    return null;
+  }
+}
+
 interface YtsVideoResult {
   title?: string;
   description?: string;
@@ -779,6 +857,15 @@ export async function extractMediaInfo(
     }
   }
 
+  if (platform === 'soundcloud') {
+    try {
+      const scCollection = await resolveSoundCloudUrlPureJs(normalizedUrl);
+      if (scCollection) return scCollection;
+    } catch {
+      // fall through to yt-dlp if available
+    }
+  }
+
   // Generic yt-dlp extractor for SoundCloud, Bandcamp, Vimeo, etc.
   try {
     const info = await runYtDlpJson(normalizedUrl, ['--flat-playlist']);
@@ -913,12 +1000,15 @@ async function transcodeAndTagAudio(params: {
   inputFile: string;
   outputFile: string;
   format: 'mp3' | 'm4a' | 'flac' | 'wav';
-  bitrate: AudioBitrate;
+  bitrate: AudioBitrate | '96';
   title: string;
   artist: string;
   album?: string;
   coverFile?: string;
-}): Promise<void> {
+}): Promise<boolean> {
+  const ffmpegBin = getFfmpegPath();
+  if (!ffmpegBin) return false;
+
   const runFfmpeg = async (withCover: boolean) => {
     const args: string[] = ['-y', '-loglevel', 'error', '-i', params.inputFile];
     const canEmbedArt =
@@ -959,7 +1049,7 @@ async function transcodeAndTagAudio(params: {
 
     args.push(params.outputFile);
 
-    await execFileAsync('/usr/bin/ffmpeg', args, {
+    await execFileAsync(ffmpegBin, args, {
       maxBuffer: 16 * 1024 * 1024,
       timeout: 180_000,
     });
@@ -967,12 +1057,17 @@ async function transcodeAndTagAudio(params: {
 
   try {
     await runFfmpeg(true);
-  } catch (err) {
+    return true;
+  } catch {
     if (params.coverFile) {
-      await runFfmpeg(false);
-    } else {
-      throw err;
+      try {
+        await runFfmpeg(false);
+        return true;
+      } catch {
+        return false;
+      }
     }
+    return false;
   }
 }
 
@@ -994,10 +1089,200 @@ async function downloadCoverImage(
   }
 }
 
+interface ScTranscoding {
+  url?: string;
+  preset?: string;
+  duration?: number;
+  snipped?: boolean;
+  format?: { protocol?: string; mime_type?: string };
+  is_legacy_transcoding?: boolean;
+}
+
+interface ScTrackPayload {
+  id?: number;
+  kind?: string;
+  title?: string;
+  description?: string;
+  duration?: number;
+  policy?: string;
+  permalink_url?: string;
+  artwork_url?: string;
+  track_authorization?: string;
+  user?: { username?: string };
+  media?: { transcodings?: ScTranscoding[] };
+  tracks?: ScTrackPayload[];
+}
+
+let cachedScClientId: { value: string; fetchedAt: number } | null = null;
+const SC_CLIENT_ID_TTL_MS = 6 * 60 * 60 * 1000;
+
+async function getSoundCloudClientId(forceRefresh = false): Promise<string | null> {
+  if (
+    !forceRefresh &&
+    cachedScClientId &&
+    Date.now() - cachedScClientId.fetchedAt < SC_CLIENT_ID_TTL_MS
+  ) {
+    return cachedScClientId.value;
+  }
+
+  try {
+    const htmlRes = await fetch('https://soundcloud.com', {
+      headers: {
+        'User-Agent':
+          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
+      },
+      signal: AbortSignal.timeout(8000),
+    });
+    if (!htmlRes.ok) return null;
+    const html = await htmlRes.text();
+    const jsUrls = [
+      ...html.matchAll(/https:\/\/a-v2\.sndcdn\.com\/assets\/[^"]+\.js/g),
+    ].map((m) => m[0]);
+
+    for (const jsUrl of jsUrls.slice(-6).reverse()) {
+      const jsRes = await fetch(jsUrl, { signal: AbortSignal.timeout(6000) });
+      if (!jsRes.ok) continue;
+      const js = await jsRes.text();
+      const match = js.match(/client_id\s*[:=]\s*["']([a-zA-Z0-9]{20,40})["']/);
+      if (match?.[1]) {
+        cachedScClientId = { value: match[1], fetchedAt: Date.now() };
+        return match[1];
+      }
+    }
+  } catch {
+    // ignore
+  }
+  return null;
+}
+
+function formatScArtwork(url?: string): string | undefined {
+  if (!url) return undefined;
+  return url.replace('-large.', '-t500x500.');
+}
+
+async function resolveSoundCloudUrlPureJs(
+  sourceUrl: string,
+): Promise<ExtractedCollection | null> {
+  let clientId = await getSoundCloudClientId();
+  if (!clientId) return null;
+
+  let res = await fetch(
+    `https://api-v2.soundcloud.com/resolve?url=${encodeURIComponent(sourceUrl)}&client_id=${clientId}`,
+    { signal: AbortSignal.timeout(8000) },
+  );
+  if (res.status === 401 || res.status === 403) {
+    clientId = await getSoundCloudClientId(true);
+    if (!clientId) return null;
+    res = await fetch(
+      `https://api-v2.soundcloud.com/resolve?url=${encodeURIComponent(sourceUrl)}&client_id=${clientId}`,
+      { signal: AbortSignal.timeout(8000) },
+    );
+  }
+  if (!res.ok) return null;
+
+  const data = (await res.json()) as ScTrackPayload;
+
+  if (data.kind === 'playlist' && Array.isArray(data.tracks)) {
+    const rawTracks = data.tracks;
+    const missingIds = rawTracks
+      .filter((t) => t.id && !t.title)
+      .map((t) => t.id!)
+      .slice(0, 50);
+
+    const hydratedMap = new Map<number, ScTrackPayload>();
+    if (missingIds.length > 0) {
+      try {
+        const batchRes = await fetch(
+          `https://api-v2.soundcloud.com/tracks?ids=${missingIds.join(',')}&client_id=${clientId}`,
+          { signal: AbortSignal.timeout(8000) },
+        );
+        if (batchRes.ok) {
+          const list = (await batchRes.json()) as ScTrackPayload[];
+          for (const item of list) {
+            if (item.id) hydratedMap.set(item.id, item);
+          }
+        }
+      } catch {
+        // ignore partial hydration errors
+      }
+    }
+
+    const tracks: MediaTrackItem[] = rawTracks
+      .map((item, idx) => {
+        const full = item.title ? item : (item.id ? hydratedMap.get(item.id) : undefined);
+        if (!full?.title) return null;
+        return {
+          id: String(full.id || `sc-${idx + 1}`),
+          index: idx + 1,
+          title: full.title,
+          artist: full.user?.username || data.user?.username || 'SoundCloud Creator',
+          durationSec: Math.round((full.duration || 0) / 1000),
+          thumbnail: formatScArtwork(full.artwork_url || data.artwork_url),
+          url: full.permalink_url || sourceUrl,
+          platform: 'soundcloud' as const,
+          isVideoCapable: false,
+        };
+      })
+      .filter((t): t is NonNullable<typeof t> => t !== null);
+
+    if (tracks.length === 0) return null;
+    const totalDurationSec = tracks.reduce((acc, t) => acc + t.durationSec, 0);
+
+    return {
+      id: String(data.id || crypto.randomUUID()),
+      kind: 'playlist',
+      platform: 'soundcloud',
+      title: data.title || 'SoundCloud Playlist',
+      creator: data.user?.username || 'SoundCloud',
+      description: data.description?.slice(0, 300),
+      thumbnail: formatScArtwork(data.artwork_url) || tracks[0]?.thumbnail,
+      sourceUrl,
+      totalDurationSec,
+      trackCount: tracks.length,
+      isVideoCapable: false,
+      tracks,
+    };
+  }
+
+  if (data.kind === 'track' && data.title) {
+    const track: MediaTrackItem = {
+      id: String(data.id || crypto.randomUUID()),
+      index: 1,
+      title: data.title,
+      artist: data.user?.username || 'SoundCloud Artist',
+      durationSec: Math.round((data.duration || 0) / 1000),
+      thumbnail: formatScArtwork(data.artwork_url),
+      url: data.permalink_url || sourceUrl,
+      platform: 'soundcloud',
+      isVideoCapable: false,
+    };
+
+    return {
+      id: track.id,
+      kind: 'track',
+      platform: 'soundcloud',
+      title: track.title,
+      creator: track.artist,
+      description: data.description?.slice(0, 300),
+      thumbnail: track.thumbnail,
+      sourceUrl,
+      totalDurationSec: track.durationSec,
+      trackCount: 1,
+      isVideoCapable: false,
+      tracks: [track],
+    };
+  }
+
+  return null;
+}
+
 interface CandidateMatch {
   url: string;
   score: number;
   source: 'soundcloud-match' | 'audius-match';
+  scTrackId?: number;
+  scTrackAuth?: string;
+  scTranscodings?: ScTranscoding[];
 }
 
 function scoreMatch(
@@ -1041,6 +1326,200 @@ function scoreMatch(
   return score;
 }
 
+async function searchSoundCloudPureJs(
+  query: string,
+  targetTitle: string,
+  targetArtist: string,
+  targetDurationSec: number,
+): Promise<CandidateMatch[]> {
+  let clientId = await getSoundCloudClientId();
+  if (!clientId) return [];
+
+  let res = await fetch(
+    `https://api-v2.soundcloud.com/search/tracks?q=${encodeURIComponent(query)}&client_id=${clientId}&limit=8`,
+    { signal: AbortSignal.timeout(8000) },
+  );
+  if (res.status === 401 || res.status === 403) {
+    clientId = await getSoundCloudClientId(true);
+    if (!clientId) return [];
+    res = await fetch(
+      `https://api-v2.soundcloud.com/search/tracks?q=${encodeURIComponent(query)}&client_id=${clientId}&limit=8`,
+      { signal: AbortSignal.timeout(8000) },
+    );
+  }
+  if (!res.ok) return [];
+
+  const json = (await res.json()) as { collection?: ScTrackPayload[] };
+  const results: CandidateMatch[] = [];
+
+  for (const entry of json.collection || []) {
+    if (!entry.permalink_url) continue;
+    const scDuration = Math.round(Number(entry.duration || 0) / 1000);
+    if (
+      targetDurationSec > 60 &&
+      (entry.policy === 'SNIP' || scDuration <= 35)
+    ) {
+      continue;
+    }
+    const score = scoreMatch(
+      entry.title || '',
+      entry.user?.username || '',
+      scDuration,
+      targetTitle,
+      targetArtist,
+      targetDurationSec,
+    );
+    results.push({
+      url: entry.permalink_url,
+      score,
+      source: 'soundcloud-match',
+      scTrackId: entry.id,
+      scTrackAuth: entry.track_authorization,
+      scTranscodings: entry.media?.transcodings,
+    });
+  }
+
+  return results;
+}
+
+async function downloadSoundCloudTrackPureJs(
+  candidate: CandidateMatch,
+  tempDir: string,
+  prefix: string,
+): Promise<{
+  filePath: string;
+  ext: 'mp3' | 'm4a';
+  segmentUrls?: string[];
+} | null> {
+  let clientId = await getSoundCloudClientId();
+  if (!clientId) return null;
+
+  let trackAuth = candidate.scTrackAuth;
+  let transcodings = candidate.scTranscodings;
+
+  if (candidate.scTrackId && (!trackAuth || !transcodings?.length)) {
+    const trRes = await fetch(
+      `https://api-v2.soundcloud.com/tracks/${candidate.scTrackId}?client_id=${clientId}`,
+      { signal: AbortSignal.timeout(8000) },
+    );
+    if (trRes.ok) {
+      const trData = (await trRes.json()) as ScTrackPayload;
+      trackAuth = trData.track_authorization || trackAuth;
+      transcodings = trData.media?.transcodings || transcodings;
+    }
+  } else if (!candidate.scTrackId && candidate.url.includes('soundcloud.com')) {
+    const resRes = await fetch(
+      `https://api-v2.soundcloud.com/resolve?url=${encodeURIComponent(candidate.url)}&client_id=${clientId}`,
+      { signal: AbortSignal.timeout(8000) },
+    );
+    if (resRes.ok) {
+      const trData = (await resRes.json()) as ScTrackPayload;
+      trackAuth = trData.track_authorization;
+      transcodings = trData.media?.transcodings;
+    }
+  }
+
+  if (!transcodings?.length) return null;
+
+  const usable = transcodings
+    .filter((t) => t.url && !t.snipped)
+    .sort((a, b) => {
+      const rank = (t: ScTranscoding) => {
+        if (t.format?.protocol === 'progressive') return 0;
+        if (t.format?.mime_type?.includes('mpeg') && !t.is_legacy_transcoding) return 1;
+        if (t.preset?.includes('aac_160')) return 2;
+        if (t.format?.mime_type?.includes('mp4')) return 3;
+        return 4;
+      };
+      return rank(a) - rank(b);
+    });
+
+  for (const tr of usable) {
+    try {
+      const sep = tr.url!.includes('?') ? '&' : '?';
+      const authPart = trackAuth
+        ? `&track_authorization=${encodeURIComponent(trackAuth)}`
+        : '';
+      const resolveRes = await fetch(
+        `${tr.url}${sep}client_id=${clientId}${authPart}`,
+        { signal: AbortSignal.timeout(8000) },
+      );
+      if (!resolveRes.ok) continue;
+      const resolvedJson = (await resolveRes.json()) as { url?: string };
+      if (!resolvedJson.url) continue;
+
+      if (tr.format?.protocol === 'progressive') {
+        const audioRes = await fetch(resolvedJson.url, {
+          signal: AbortSignal.timeout(30_000),
+        });
+        if (!audioRes.ok) continue;
+        const buf = Buffer.from(await audioRes.arrayBuffer());
+        if (buf.length < 32_768) continue;
+        const filePath = path.join(tempDir, `${prefix}mp3`);
+        fs.writeFileSync(filePath, buf);
+        return { filePath, ext: 'mp3' };
+      }
+
+      // HLS playlist download & assembly in pure Node.js
+      const m3u8Res = await fetch(resolvedJson.url, {
+        signal: AbortSignal.timeout(10_000),
+      });
+      if (!m3u8Res.ok) continue;
+      const m3u8 = await m3u8Res.text();
+
+      const segmentUrls: string[] = [];
+      const initMatch = m3u8.match(/#EXT-X-MAP:URI="([^"]+)"/);
+      if (initMatch?.[1]) {
+        segmentUrls.push(initMatch[1]);
+      }
+      for (const line of m3u8.split(/\r?\n/)) {
+        const trimmedLine = line.trim();
+        if (trimmedLine.startsWith('http://') || trimmedLine.startsWith('https://')) {
+          segmentUrls.push(trimmedLine);
+        }
+      }
+      if (segmentUrls.length === 0) continue;
+
+      const chunks: Buffer[] = new Array(segmentUrls.length);
+      let cursor = 0;
+      const concurrency = Math.min(6, segmentUrls.length);
+      let failed = false;
+
+      const worker = async () => {
+        while (cursor < segmentUrls.length && !failed) {
+          const i = cursor++;
+          const segRes = await fetch(segmentUrls[i], {
+            signal: AbortSignal.timeout(15_000),
+          });
+          if (!segRes.ok) {
+            failed = true;
+            return;
+          }
+          chunks[i] = Buffer.from(await segRes.arrayBuffer());
+        }
+      };
+
+      await Promise.all(Array.from({ length: concurrency }, () => worker()));
+      if (failed || chunks.some((c) => !c)) continue;
+
+      const combined = Buffer.concat(chunks);
+      if (combined.length < 32_768) continue;
+
+      const ext: 'mp3' | 'm4a' =
+        Boolean(initMatch) || Boolean(tr.format?.mime_type?.includes('mp4'))
+          ? 'm4a'
+          : 'mp3';
+      const filePath = path.join(tempDir, `${prefix}${ext}`);
+      fs.writeFileSync(filePath, combined);
+      return { filePath, ext, segmentUrls };
+    } catch {
+      // try next transcoding
+    }
+  }
+
+  return null;
+}
+
 async function searchSourcesForQuery(
   query: string,
   targetTitle: string,
@@ -1050,6 +1529,21 @@ async function searchSourcesForQuery(
   const candidates: CandidateMatch[] = [];
 
   const searchSoundCloud = async () => {
+    try {
+      const pureResults = await searchSoundCloudPureJs(
+        query,
+        targetTitle,
+        targetArtist,
+        targetDurationSec,
+      );
+      if (pureResults.length > 0) {
+        candidates.push(...pureResults);
+        return;
+      }
+    } catch {
+      // fall through to optional yt-dlp
+    }
+
     try {
       const bin = await ensureYtDlp();
       const { stdout } = await execFileAsync(
@@ -1090,8 +1584,8 @@ async function searchSourcesForQuery(
           source: 'soundcloud-match',
         });
       }
-    } catch (scErr) {
-      console.warn('[Soundpress] SoundCloud search error:', scErr instanceof Error ? scErr.message : scErr);
+    } catch {
+      // yt-dlp may be unavailable in serverless environments
     }
   };
 
@@ -1203,7 +1697,6 @@ export async function prepareMediaDownload(
   input: PrepareDownloadInput,
 ): Promise<PreparedFileResponse> {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'soundpress-job-'));
-  const bin = await ensureYtDlp();
   const bitrate = String(input.bitrate || '320').replace(/k$/i, '') as AudioBitrate;
   const quality: VideoQuality = input.quality || '1080';
   const safeBase = sanitizeFilename(
@@ -1225,23 +1718,66 @@ export async function prepareMediaDownload(
   const registerFile = (
     filePath: string,
     resolvedSource: PreparedFileResponse['resolvedSource'],
+    opts?: {
+      filenameOverride?: string;
+      mimeTypeOverride?: string;
+      segmentUrls?: string[];
+    },
   ): PreparedFileResponse => {
     const stat = fs.statSync(filePath);
     const fileId = crypto.randomUUID();
+    const outFilename = opts?.filenameOverride || finalFilename;
+    const outMime = opts?.mimeTypeOverride || getMimeType(input.format);
+
+    if (isServerless) {
+      if (stat.size <= SERVERLESS_MAX_INLINE_BYTES) {
+        const buf = fs.readFileSync(filePath);
+        const inlineDataUrl = `data:${outMime};base64,${buf.toString('base64')}`;
+        fs.rmSync(tempDir, { recursive: true, force: true });
+        return {
+          fileId,
+          filename: outFilename,
+          mimeType: outMime,
+          sizeBytes: stat.size,
+          resolvedSource,
+          resolvedTitle: input.title,
+          downloadUrl: `/api/file/${fileId}`,
+          inlineDataUrl,
+        };
+      }
+
+      if (opts?.segmentUrls && opts.segmentUrls.length > 0) {
+        const proxiedSegments = opts.segmentUrls.map(
+          (u) => `/api/proxy-segment?token=${encodeURIComponent(signSegmentUrl(u))}`,
+        );
+        fs.rmSync(tempDir, { recursive: true, force: true });
+        return {
+          fileId,
+          filename: outFilename,
+          mimeType: outMime,
+          sizeBytes: stat.size,
+          resolvedSource,
+          resolvedTitle: input.title,
+          downloadUrl: `/api/file/${fileId}`,
+          proxiedSegments,
+        };
+      }
+    }
+
     storedFiles.set(fileId, {
       fileId,
       filePath,
       tempDir,
-      filename: finalFilename,
-      mimeType: getMimeType(input.format),
+      filename: outFilename,
+      mimeType: outMime,
       sizeBytes: stat.size,
       resolvedSource,
       createdAt: Date.now(),
     });
     return {
       fileId,
-      filename: finalFilename,
-      mimeType: getMimeType(input.format),
+      filename: outFilename,
+      mimeType: outMime,
       sizeBytes: stat.size,
       resolvedSource,
       resolvedTitle: input.title,
@@ -1249,48 +1785,145 @@ export async function prepareMediaDownload(
     };
   };
 
-  try {
-    // Direct yt-dlp path for non-Spotify URLs
-    if (input.platform !== 'spotify') {
-      const rawOutputTemplate = path.join(tempDir, 'raw.%(ext)s');
-      const ytArgs: string[] = [
-        '--ffmpeg-location',
-        '/usr/bin/ffmpeg',
-        '--no-playlist',
-        '--no-progress',
-        '--max-filesize',
-        '250M',
-        '-o',
-        rawOutputTemplate,
-      ];
-
-      if (cookiesPath) {
-        ytArgs.push('--cookies', cookiesPath);
-      }
-
-      if (input.mode === 'video') {
-        const formatSelector =
-          input.format === 'webm'
-            ? `bestvideo[height<=${quality}][ext=webm]+bestaudio[ext=webm]/bestvideo[height<=${quality}]+bestaudio/best[height<=${quality}]/best`
-            : `bestvideo[height<=${quality}][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=${quality}]+bestaudio/best[height<=${quality}]/best`;
-        ytArgs.push('-f', formatSelector, '--merge-output-format', input.format);
-      } else {
-        ytArgs.push(
-          '-x',
-          '--audio-format',
-          input.format,
-          '--audio-quality',
-          `${bitrate}K`,
-          '--add-metadata',
-        );
-        if (input.format === 'mp3' || input.format === 'm4a') {
-          ytArgs.push('--embed-thumbnail');
+  const finalizeAudio = async (params: {
+    rawInput: string;
+    rawExt: 'mp3' | 'm4a';
+    audioFormat: 'mp3' | 'm4a' | 'flac' | 'wav';
+    coverFile?: string;
+    resolvedSource: PreparedFileResponse['resolvedSource'];
+    segmentUrls?: string[];
+  }): Promise<PreparedFileResponse> => {
+    const ffmpegBin = getFfmpegPath();
+    if (ffmpegBin) {
+      const ok = await transcodeAndTagAudio({
+        inputFile: params.rawInput,
+        outputFile: finalPath,
+        format: params.audioFormat,
+        bitrate,
+        title: input.title,
+        artist: input.artist,
+        album: input.album,
+        coverFile: params.coverFile,
+      });
+      if (ok && fs.existsSync(finalPath)) {
+        const outSize = fs.statSync(finalPath).size;
+        if (
+          isServerless &&
+          outSize > SERVERLESS_MAX_INLINE_BYTES &&
+          (params.audioFormat === 'mp3' || params.audioFormat === 'm4a')
+        ) {
+          // Compress to 96k on serverless so full songs fit inside Vercel's inline payload budget
+          const compactPath = path.join(tempDir, `${safeBase}-compact.${params.audioFormat}`);
+          const compactOk = await transcodeAndTagAudio({
+            inputFile: params.rawInput,
+            outputFile: compactPath,
+            format: params.audioFormat,
+            bitrate: '96',
+            title: input.title,
+            artist: input.artist,
+            album: input.album,
+            coverFile: params.coverFile,
+          });
+          if (compactOk && fs.existsSync(compactPath)) {
+            if (fs.statSync(compactPath).size <= SERVERLESS_MAX_INLINE_BYTES) {
+              return registerFile(compactPath, params.resolvedSource);
+            }
+          }
         }
+
+        if (
+          isServerless &&
+          outSize > SERVERLESS_MAX_INLINE_BYTES &&
+          params.segmentUrls?.length
+        ) {
+          return registerFile(params.rawInput, params.resolvedSource, {
+            filenameOverride: `${safeBase}.${params.rawExt}`,
+            mimeTypeOverride: getMimeType(params.rawExt),
+            segmentUrls: params.segmentUrls,
+          });
+        }
+
+        return registerFile(finalPath, params.resolvedSource);
       }
+    }
 
-      ytArgs.push(input.url);
+    // No ffmpeg binary or transcode skipped -> serve valid raw audio file directly
+    return registerFile(params.rawInput, params.resolvedSource, {
+      filenameOverride: `${safeBase}.${params.rawExt}`,
+      mimeTypeOverride: getMimeType(params.rawExt),
+      segmentUrls: params.segmentUrls,
+    });
+  };
 
+  try {
+    // Pure-JS direct download for SoundCloud URLs (no yt-dlp/python required)
+    if (input.platform === 'soundcloud' && input.mode === 'audio') {
+      const audioFormat = input.format as 'mp3' | 'm4a' | 'flac' | 'wav';
+      const coverFile = await downloadCoverImage(input.thumbnail, tempDir);
+      const scDirect = await downloadSoundCloudTrackPureJs(
+        { url: input.url, score: 100, source: 'soundcloud-match' },
+        tempDir,
+        'sc-direct.',
+      );
+      if (scDirect) {
+        return await finalizeAudio({
+          rawInput: scDirect.filePath,
+          rawExt: scDirect.ext,
+          audioFormat,
+          coverFile,
+          resolvedSource: 'direct',
+          segmentUrls: scDirect.segmentUrls,
+        });
+      }
+    }
+
+    // Optional direct yt-dlp path for non-Spotify URLs when runtime supports yt-dlp + python + ffmpeg
+    const ffmpegForYtDlp = getFfmpegPath();
+    const shouldTryYtDlp =
+      input.platform !== 'spotify' &&
+      (input.mode === 'video' || Boolean(cookiesPath) || !isServerless);
+
+    if (shouldTryYtDlp && ffmpegForYtDlp) {
       try {
+        const bin = await ensureYtDlp();
+        const rawOutputTemplate = path.join(tempDir, 'raw.%(ext)s');
+        const ytArgs: string[] = [
+          '--ffmpeg-location',
+          ffmpegForYtDlp,
+          '--no-playlist',
+          '--no-progress',
+          '--max-filesize',
+          '250M',
+          '-o',
+          rawOutputTemplate,
+        ];
+
+        if (cookiesPath) {
+          ytArgs.push('--cookies', cookiesPath);
+        }
+
+        if (input.mode === 'video') {
+          const formatSelector =
+            input.format === 'webm'
+              ? `bestvideo[height<=${quality}][ext=webm]+bestaudio[ext=webm]/bestvideo[height<=${quality}]+bestaudio/best[height<=${quality}]/best`
+              : `bestvideo[height<=${quality}][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=${quality}]+bestaudio/best[height<=${quality}]/best`;
+          ytArgs.push('-f', formatSelector, '--merge-output-format', input.format);
+        } else {
+          ytArgs.push(
+            '-x',
+            '--audio-format',
+            input.format,
+            '--audio-quality',
+            `${bitrate}K`,
+            '--add-metadata',
+          );
+          if (input.format === 'mp3' || input.format === 'm4a') {
+            ytArgs.push('--embed-thumbnail');
+          }
+        }
+
+        ytArgs.push(input.url);
+
         await execFileAsync(bin, ytArgs, {
           maxBuffer: 16 * 1024 * 1024,
           timeout: 180_000,
@@ -1330,15 +1963,17 @@ export async function prepareMediaDownload(
             400,
           );
         }
-        // If audio mode on YouTube hit bot check, fall through to multi-source audio resolver below!
+        // In audio mode, seamlessly fall through to pure-JS multi-source audio resolver below
       }
     }
 
-    // Audio resolution path (Spotify tracks OR YouTube Audio fallback)
+    // Audio resolution path (Spotify tracks, SoundCloud fallback, OR YouTube Audio fallback)
     if (input.mode === 'video') {
       throw new MediaEngineError(
         'VIDEO_NOT_SUPPORTED',
-        'Spotify tracks do not have downloadable video streams. Switch to Audio mode (MP3, M4A, FLAC, WAV).',
+        input.platform === 'youtube'
+          ? 'Video download requires a Python/ffmpeg runtime or YouTube cookies. Switch to Audio mode (MP3/M4A) for instant cloud download.'
+          : 'This source does not have downloadable video streams. Switch to Audio mode (MP3, M4A, FLAC, WAV).',
         400,
       );
     }
@@ -1347,8 +1982,9 @@ export async function prepareMediaDownload(
     const coverFile = await downloadCoverImage(input.thumbnail, tempDir);
 
     // If cookies were supplied and platform is spotify, try YouTube search via yt-dlp first!
-    if (input.platform === 'spotify' && cookiesPath) {
+    if (input.platform === 'spotify' && cookiesPath && ffmpegForYtDlp) {
       try {
+        const bin = await ensureYtDlp();
         const searchQuery =
           buildSearchQueries(input.title, input.artist)[0] || input.title;
         const rawOut = path.join(tempDir, 'ytsp.%(ext)s');
@@ -1356,7 +1992,7 @@ export async function prepareMediaDownload(
           bin,
           [
             '--ffmpeg-location',
-            '/usr/bin/ffmpeg',
+            ffmpegForYtDlp,
             '--cookies',
             cookiesPath,
             '-x',
@@ -1372,17 +2008,14 @@ export async function prepareMediaDownload(
         );
         const produced = fs.readdirSync(tempDir).find((f) => f.startsWith('ytsp.'));
         if (produced) {
-          await transcodeAndTagAudio({
-            inputFile: path.join(tempDir, produced),
-            outputFile: finalPath,
-            format: audioFormat,
-            bitrate,
-            title: input.title,
-            artist: input.artist,
-            album: input.album,
+          const producedExt = produced.endsWith('.m4a') ? 'm4a' : 'mp3';
+          return await finalizeAudio({
+            rawInput: path.join(tempDir, produced),
+            rawExt: producedExt,
+            audioFormat,
             coverFile,
+            resolvedSource: 'youtube-direct',
           });
-          return registerFile(finalPath, 'youtube-direct');
         }
       } catch {
         // continue to SoundCloud / Audius
@@ -1399,40 +2032,54 @@ export async function prepareMediaDownload(
       const candidate = candidates[idx];
       if (candidate.source === 'soundcloud-match') {
         try {
-          const prefix = `sc${idx}.`;
-          const rawOut = path.join(tempDir, `sc${idx}.%(ext)s`);
-          await execFileAsync(
-            bin,
-            [
-              '--ffmpeg-location',
-              '/usr/bin/ffmpeg',
-              '--no-playlist',
-              '--no-progress',
-              '--max-filesize',
-              '150M',
-              '-o',
-              rawOut,
-              candidate.url,
-            ],
-            { maxBuffer: 16 * 1024 * 1024, timeout: 120_000 },
+          const scPure = await downloadSoundCloudTrackPureJs(
+            candidate,
+            tempDir,
+            `sc${idx}.`,
           );
-          const files = fs.readdirSync(tempDir);
-          const produced = files.find((f) => f.startsWith(prefix));
-          if (produced) {
-            await transcodeAndTagAudio({
-              inputFile: path.join(tempDir, produced),
-              outputFile: finalPath,
-              format: audioFormat,
-              bitrate,
-              title: input.title,
-              artist: input.artist,
-              album: input.album,
+          if (scPure) {
+            return await finalizeAudio({
+              rawInput: scPure.filePath,
+              rawExt: scPure.ext,
+              audioFormat,
               coverFile,
+              resolvedSource: 'soundcloud-match',
+              segmentUrls: scPure.segmentUrls,
             });
-            return registerFile(finalPath, 'soundcloud-match');
           }
-        } catch (dlErr) {
-          console.warn('[Soundpress] Candidate download failed:', candidate.url, dlErr instanceof Error ? dlErr.message.slice(0, 200) : dlErr);
+
+          if (!isServerless) {
+            const bin = await ensureYtDlp();
+            const prefix = `scyt${idx}.`;
+            const rawOut = path.join(tempDir, `scyt${idx}.%(ext)s`);
+            await execFileAsync(
+              bin,
+              [
+                ...(ffmpegForYtDlp ? ['--ffmpeg-location', ffmpegForYtDlp] : []),
+                '--no-playlist',
+                '--no-progress',
+                '--max-filesize',
+                '150M',
+                '-o',
+                rawOut,
+                candidate.url,
+              ],
+              { maxBuffer: 16 * 1024 * 1024, timeout: 120_000 },
+            );
+            const produced = fs.readdirSync(tempDir).find((f) => f.startsWith(prefix));
+            if (produced) {
+              const producedExt = produced.endsWith('.mp3') ? 'mp3' : 'm4a';
+              return await finalizeAudio({
+                rawInput: path.join(tempDir, produced),
+                rawExt: producedExt,
+                audioFormat,
+                coverFile,
+                resolvedSource: 'soundcloud-match',
+              });
+            }
+          }
+        } catch {
+          // try next ranked candidate
         }
       }
 
@@ -1447,17 +2094,13 @@ export async function prepareMediaDownload(
             if (buf.length < 32_768) continue;
             const rawInput = path.join(tempDir, `audius${idx}.mp3`);
             fs.writeFileSync(rawInput, buf);
-            await transcodeAndTagAudio({
-              inputFile: rawInput,
-              outputFile: finalPath,
-              format: audioFormat,
-              bitrate,
-              title: input.title,
-              artist: input.artist,
-              album: input.album,
+            return await finalizeAudio({
+              rawInput,
+              rawExt: 'mp3',
+              audioFormat,
               coverFile,
+              resolvedSource: 'audius-match',
             });
-            return registerFile(finalPath, 'audius-match');
           }
         } catch {
           // try next ranked candidate
@@ -1472,17 +2115,13 @@ export async function prepareMediaDownload(
       if (previewRes.ok) {
         const rawPreview = path.join(tempDir, 'preview.mp3');
         fs.writeFileSync(rawPreview, Buffer.from(await previewRes.arrayBuffer()));
-        await transcodeAndTagAudio({
-          inputFile: rawPreview,
-          outputFile: finalPath,
-          format: audioFormat,
-          bitrate,
-          title: input.title,
-          artist: input.artist,
-          album: input.album,
+        return await finalizeAudio({
+          rawInput: rawPreview,
+          rawExt: 'mp3',
+          audioFormat,
           coverFile,
+          resolvedSource: 'spotify-preview',
         });
-        return registerFile(finalPath, 'spotify-preview');
       }
     }
 
@@ -1581,6 +2220,30 @@ export async function prepareZipArchive(params: {
 
   const stat = fs.statSync(zipPath);
   const fileId = crypto.randomUUID();
+
+  if (isServerless) {
+    if (stat.size <= SERVERLESS_MAX_INLINE_BYTES) {
+      const buf = fs.readFileSync(zipPath);
+      const inlineDataUrl = `data:application/zip;base64,${buf.toString('base64')}`;
+      fs.rmSync(zipDir, { recursive: true, force: true });
+      return {
+        fileId,
+        filename: safeArchiveName,
+        mimeType: 'application/zip',
+        sizeBytes: stat.size,
+        resolvedSource: 'direct',
+        downloadUrl: `/api/file/${fileId}`,
+        inlineDataUrl,
+      };
+    }
+    fs.rmSync(zipDir, { recursive: true, force: true });
+    throw new MediaEngineError(
+      'ZIP_TOO_LARGE',
+      'ZIP exceeds serverless download size limit. Use "Download Selected Separately" to save each track directly.',
+      413,
+    );
+  }
+
   storedFiles.set(fileId, {
     fileId,
     filePath: zipPath,

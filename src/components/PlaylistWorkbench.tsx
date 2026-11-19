@@ -469,6 +469,11 @@ export function PlaylistWorkbench({
                             void triggerBrowserDownload(
                               status.downloadUrl!,
                               status.filename,
+                              {
+                                inlineDataUrl: status.inlineDataUrl,
+                                proxiedSegments: status.proxiedSegments,
+                                mimeType: status.mimeType,
+                              },
                             )
                           }
                           className="inline-flex items-center gap-1.5 rounded-md border border-lime-400/35 bg-lime-400/15 px-2.5 py-1.5 text-xs font-medium text-lime-200 hover:bg-lime-400/25 whitespace-nowrap shrink-0 cursor-pointer"

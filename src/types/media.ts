@@ -59,6 +59,8 @@ export interface PreparedFileResponse {
     | 'spotify-preview';
   resolvedTitle?: string;
   downloadUrl: string;
+  inlineDataUrl?: string;
+  proxiedSegments?: string[];
 }
 
 export type TrackDownloadState =
@@ -73,6 +75,9 @@ export interface TrackJobStatus {
   message?: string;
   resolvedSource?: PreparedFileResponse['resolvedSource'];
   downloadUrl?: string;
+  inlineDataUrl?: string;
+  proxiedSegments?: string[];
+  mimeType?: string;
   filename?: string;
   sizeBytes?: number;
   errorCode?: string;
@@ -89,6 +94,9 @@ export interface QueueHistoryItem {
   state: TrackDownloadState;
   resolvedSource?: PreparedFileResponse['resolvedSource'];
   downloadUrl?: string;
+  inlineDataUrl?: string;
+  proxiedSegments?: string[];
+  mimeType?: string;
   filename?: string;
   sizeBytes?: number;
   errorMessage?: string;

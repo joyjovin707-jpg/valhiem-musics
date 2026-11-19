@@ -8,6 +8,7 @@ import {
   getStoredFile,
   prepareMediaDownload,
   prepareZipArchive,
+  verifySegmentToken,
   type PrepareDownloadInput,
 } from './mediaEngine.ts';
 
@@ -17,8 +18,10 @@ export function createApiApp(): express.Express {
   const app = express();
   app.use(express.json({ limit: '2mb' }));
 
-  // Warm up yt-dlp binary check in background
-  void ensureYtDlp().catch(() => {});
+  // Warm up yt-dlp binary check in background when running in non-serverless environments
+  if (!process.env.VERCEL && !process.env.AWS_LAMBDA_FUNCTION_NAME) {
+    void ensureYtDlp().catch(() => {});
+  }
 
   app.get('/api/health', (_req, res) => {
     res.json({ ok: true });
@@ -88,6 +91,35 @@ export function createApiApp(): express.Express {
         error: err instanceof Error ? err.message : 'Failed to build ZIP archive.',
         code: 'INTERNAL_ERROR',
       });
+    }
+  });
+
+  app.get('/api/proxy-segment', async (req, res) => {
+    const token = typeof req.query.token === 'string' ? req.query.token : '';
+    const targetUrl = token ? verifySegmentToken(token) : null;
+    if (!targetUrl) {
+      res.status(403).json({ error: 'Invalid or expired media segment token.' });
+      return;
+    }
+
+    try {
+      const upstream = await fetch(targetUrl, {
+        signal: AbortSignal.timeout(15_000),
+      });
+      if (!upstream.ok) {
+        res.status(upstream.status).json({ error: 'Segment fetch failed.' });
+        return;
+      }
+      const buf = Buffer.from(await upstream.arrayBuffer());
+      res.setHeader(
+        'Content-Type',
+        upstream.headers.get('content-type') || 'application/octet-stream',
+      );
+      res.setHeader('Content-Length', String(buf.length));
+      res.setHeader('Cache-Control', 'private, max-age=300');
+      res.send(buf);
+    } catch {
+      res.status(502).json({ error: 'Upstream segment request timed out.' });
     }
   });
 

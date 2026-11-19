@@ -171,6 +171,11 @@ export function SingleMediaPanel({
                     void triggerBrowserDownload(
                       jobStatus.downloadUrl!,
                       jobStatus.filename,
+                      {
+                        inlineDataUrl: jobStatus.inlineDataUrl,
+                        proxiedSegments: jobStatus.proxiedSegments,
+                        mimeType: jobStatus.mimeType,
+                      },
                     )
                   }
                   className="inline-flex items-center gap-2 rounded-lg border border-lime-400/35 bg-lime-400/10 px-4 py-2.5 text-xs font-medium text-lime-200 transition-colors hover:bg-lime-400/20 whitespace-nowrap shrink-0 cursor-pointer"
